@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JARVIS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="scan"></div>
+<div class="grid-bg"></div>
+
+<div class="hud">
+
+  <!-- ══ LEFT · command matrix ══ -->
+  <section class="col left">
+    <header class="colhead">
+      <div class="brandline"><span class="bdot"></span> J · A · R · V · I · S</div>
+      <div class="h">Command<br>Matrix</div>
+      <div class="sub">Press button → speak instructions</div>
+    </header>
+
+    <div class="cmds" id="cmds">
+      <button class="cmd" data-cmd="/new"        data-desc="Fresh thread"><b>/new</b><span>Fresh thread</span></button>
+      <button class="cmd" data-cmd="/goal"       data-desc="Standing objective"><b>/goal</b><span>Standing objective</span></button>
+      <button class="cmd" data-cmd="/profile"    data-desc="Profile info"><b>/profile</b><span>Profile info</span></button>
+      <button class="cmd" data-cmd="/background"  data-desc="Async mission"><b>/background</b><span>Async mission</span></button>
+      <button class="cmd" data-cmd="/personality" data-desc="Set persona"><b>/personality</b><span>Set persona</span></button>
+      <button class="cmd" data-cmd="/kanban"     data-desc="Work queue"><b>/kanban</b><span>Work queue</span></button>
+    </div>
+
+    <div class="uplink">
+      <div class="lbl">Pending uplink</div>
+      <div class="field">
+        <textarea id="input" rows="3" spellcheck="false"
+          placeholder="Speak or type here. Press a command button first to prefix slash commands."></textarea>
+      </div>
+      <div class="tip" id="tip">Press <b>◉ VOICE</b> once, then just talk — it keeps listening between turns. Click again to end.</div>
+      <div class="controls">
+        <button id="mic"  class="ctl mic"  title="Start a voice conversation — talk, it keeps listening between turns. Click again to end.">◉ VOICE</button>
+        <button id="run"  class="ctl run"  title="Send (⌘↵)">TRANSMIT ▸</button>
+        <button id="mute" class="ctl mute on" title="Mute Jarvis">🔊</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ CENTER · reactor ══ -->
+  <section class="col center">
+    <div class="reactor" id="reactor">
+      <svg viewBox="0 0 480 480" id="core">
+        <defs>
+          <radialGradient id="orb" cx="50%" cy="45%" r="55%">
+            <stop offset="0%"  stop-color="#d5fbff"/>
+            <stop offset="35%" stop-color="#37e6ff"/>
+            <stop offset="75%" stop-color="#0a7d9c"/>
+            <stop offset="100%" stop-color="#031e2b"/>
+          </radialGradient>
+          <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="5" result="b"/>
+            <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <circle class="ring rr1" cx="240" cy="240" r="220"/>
+        <circle class="ring rr2" cx="240" cy="240" r="184"/>
+        <circle class="ring rr3" cx="240" cy="240" r="150"/>
+        <circle class="ring rr4" cx="240" cy="240" r="112"/>
+        <circle class="arcA" cx="240" cy="240" r="200" filter="url(#soft)"/>
+        <circle class="arcB" cx="240" cy="240" r="168" filter="url(#soft)"/>
+        <g id="ticks480"></g>
+        <path class="comet" d="M60 300 Q 180 360 240 300" />
+        <circle class="orb" cx="240" cy="240" r="58" fill="url(#orb)" filter="url(#soft)"/>
+        <circle class="orbrim" cx="240" cy="240" r="58"/>
+      </svg>
+      <div class="status">
+        <div class="stbrand">JARVIS</div>
+        <div class="stword" id="stword">STANDBY</div>
+        <div class="strun"  id="strun">awaiting uplink</div>
+      </div>
+    </div>
+
+    <div class="response" id="responseWrap">
+      <div class="rhead"><span>JARVIS Response</span><span class="rtag" id="rtag">IDLE</span></div>
+      <div class="rbody" id="response"><span class="rplaceholder">Standing by. Transmit an instruction.</span></div>
+    </div>
+  </section>
+
+  <!-- ══ RIGHT · action log ══ -->
+  <section class="col right">
+    <header class="colhead row">
+      <div class="h sm">Action Log</div>
+      <div class="live" id="live">◍ LIVE TELEMETRY</div>
+    </header>
+
+    <div class="sysgrid">
+      <div class="sysrow"><span>Gateway</span><b id="sy-gw" class="ok">online</b></div>
+      <div class="sysrow"><span>Brain</span><b id="sy-brain">—</b></div>
+      <div class="sysrow"><span>Voice</span><b id="sy-voice">—</b></div>
+      <div class="sysrow"><span>Profile</span><b id="sy-profile">default</b></div>
+      <div class="sysrow"><span>Session</span><b id="sy-session">none</b></div>
+      <div class="sysrow"><span>Uplink</span><b id="sy-clock">—</b></div>
+    </div>
+
+    <div class="log-lbl">Event stream</div>
+    <div class="log" id="log"></div>
+  </section>
+
+</div>
+
+<div class="brandmark">J.A.R.V.I.S</div>
+
+<script src="app.js"></script>
+</body>
+</html>
