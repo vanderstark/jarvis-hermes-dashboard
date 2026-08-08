@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# JARVIS — NORMAL mode.
-# Real Claude Code brain, your connectors, no scripted answers. This is the
-# honest assistant anyone building it should run.
-#
-# Run from a normal Terminal window (not inside a Claude Code session).
-cd "$(dirname "$0")" || exit 1
-unset CLAUDECODE CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY
-lsof -ti tcp:"${JARVIS_PORT:-8730}" | xargs kill -9 2>/dev/null
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
+export JARVIS_RUNTIME="${JARVIS_RUNTIME:-auto}"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  printf 'JARVIS needs Python 3. Install Python, then run this script again.\n' >&2
+  exit 1
+fi
+
 exec python3 server.py

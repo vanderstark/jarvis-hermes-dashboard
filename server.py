@@ -1,17 +1,20 @@
 """
-JARVIS Live — a HUD that drives Claude Code (Path A).
+JARVIS Live — a HUD that drives Hermes Agent.
 
     python3 server.py
 
-No API key needed for the brain: it runs your own `claude` CLI, so it uses your
-Claude Code subscription and every MCP connector / skill you've configured. The
-ElevenLabs key (in .env) is only for voice, and only ever lives server-side.
+The brain is your own Hermes Agent CLI/profile. Hermes keeps access to the same
+configured tools, browser/Chrome automation, MCP servers, skills, memory, and
+third-party integrations that your normal Hermes sessions have. Voice can use the
+browser Web Speech API, with optional server-side ElevenLabs STT/TTS if present.
 """
 import json
 import mimetypes
 import os
 import pathlib
+import secrets
 import sys
+import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -33,6 +36,10 @@ import runtime          # noqa: E402
 import voice            # noqa: E402
 
 PORT = int(os.environ.get("JARVIS_PORT", "8730"))
+API_TOKEN = secrets.token_urlsafe(32)
+RUN_LOCK = threading.Lock()
+MAX_JSON_BODY = 1024 * 1024
+MAX_AUDIO_BODY = 12 * 1024 * 1024
 
 # The Jarvis persona, appended to every run. Without it, the model answers as a
 # coding agent and narrates its own tooling — which is not what you want spoken
@@ -47,7 +54,7 @@ def persona():
         base = ""
     extra = commands.context_block()      # profile / goal / personality / queue
     return "\n\n".join(x for x in (base, extra) if x)
-# one continuing Claude Code conversation until the user hits /new
+# One continuing Hermes conversation until the user hits /new.
 SESSION = {"id": None}
 
 
@@ -76,23 +83,50 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _read(self):
+    def _read(self, limit):
         n = int(self.headers.get("Content-Length", 0))
+        if n < 0 or n > limit:
+            raise ValueError(f"request body exceeds {limit} bytes")
         return self.rfile.read(n) if n else b""
+
+    def _host_ok(self):
+        host = self.headers.get("Host", "")
+        return host in {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+
+    def _origin_ok(self):
+        origin = self.headers.get("Origin")
+        return origin in {
+            f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"
+        }
+
+    def _token_ok(self):
+        supplied = self.headers.get("X-Jarvis-Token", "")
+        return bool(supplied) and secrets.compare_digest(supplied, API_TOKEN)
 
     # ── GET ──────────────────────────────────────────────────
     def do_GET(self):
+        if not self._host_ok():
+            return self._json({"error": "invalid host"}, 403)
         p = urlparse(self.path).path
         if p == "/api/status":
             return self._json(dict(
                 runtime=runtime.runtime_kind(),
                 permission=runtime.PERMISSION,
+                profile=runtime.PROFILE,
+                source=runtime.SOURCE,
                 workdir=runtime.WORKDIR,
-                model=runtime.MODEL or "(claude default)",
-                stt="elevenlabs" if voice.available() else "none",
-                tts="elevenlabs" if voice.available() else "none",
+                model=runtime.MODEL or "Hermes default",
+                tools=runtime.hermes_tools_snapshot(),
+                browser_stt=True,
+                browser_tts=True,
+                voice_mode=os.environ.get("JARVIS_VOICE_MODE", "elevenlabs" if voice.available() else "browser"),
+                voice_id=voice.voice_id() if voice.available() else "browser",
+                stt="elevenlabs" if voice.available() else "browser",
+                tts="elevenlabs" if voice.available() else "browser",
                 session=SESSION["id"]))
         if p == "/api/jobs":
+            if not self._token_ok():
+                return self._json({"error": "unauthorized"}, 401)
             # finished background missions, reported once each
             return self._json(dict(done=commands.take_finished(),
                                    running=[j for j in commands.jobs_snapshot()
@@ -103,12 +137,27 @@ class Handler(BaseHTTPRequestHandler):
         if not str(f).startswith(str(UI.resolve())) or not f.is_file():
             return self._bytes(b"not found", "text/plain", 404)
         ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        return self._bytes(f.read_bytes(), ctype)
+        data = f.read_bytes()
+        if rel == "index.html":
+            data = data.replace(b"__JARVIS_TOKEN__", API_TOKEN.encode())
+        return self._bytes(data, ctype)
 
     # ── POST ─────────────────────────────────────────────────
     def do_POST(self):
         p = urlparse(self.path).path
-        raw = self._read()
+        if not self._host_ok() or not self._origin_ok():
+            return self._json({"error": "request origin rejected"}, 403)
+        if not self._token_ok():
+            return self._json({"error": "unauthorized"}, 401)
+        ctype = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        if p in {"/api/run", "/api/speak", "/api/new", "/api/cancel"} and ctype != "application/json":
+            return self._json({"error": "application/json required"}, 415)
+        if p == "/api/listen" and not ctype.startswith("audio/"):
+            return self._json({"error": "audio content type required"}, 415)
+        try:
+            raw = self._read(MAX_AUDIO_BODY if p == "/api/listen" else MAX_JSON_BODY)
+        except (TypeError, ValueError):
+            return self._json({"error": "request body too large"}, 413)
 
         if p == "/api/speak":
             try:
@@ -125,11 +174,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(e)[:300], "text": ""}, 503)
 
         if p == "/api/new":
+            runtime.cancel_active()
             SESSION["id"] = None
             return self._json({"ok": True})
 
+        if p == "/api/cancel":
+            stopped = runtime.cancel_active()
+            SESSION["id"] = None
+            return self._json({"ok": True, "stopped": stopped})
+
         if p == "/api/run":
-            return self._stream_run(raw)
+            if not RUN_LOCK.acquire(blocking=False):
+                return self._json({"error": "JARVIS is already processing a request"}, 409)
+            try:
+                return self._stream_run(raw)
+            finally:
+                RUN_LOCK.release()
 
         return self._json({"error": "no such endpoint"}, 404)
 
@@ -158,7 +218,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write((json.dumps(ev) + "\n").encode())
             self.wfile.flush()
 
-        # ── the command matrix: /new /profile /goal /personality /kanban /background
+        # ── the command matrix: /new /profile /goal /personality /kanban /mission /background /tools /status /browser
         cmd = commands.handle(
             message,
             runner=lambda m: runtime.run(m, None, persona()))
@@ -177,8 +237,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             for ev in runtime.run(message, SESSION["id"], system):
-                # only remember a real claude session — never "demo"/"mock",
-                # or the next real run sends --resume demo and claude refuses
+                # Only remember a real Hermes session, never demo/mock identifiers.
                 sid = ev.get("session_id")
                 # Only remember a session that actually COMPLETED. Storing it from
                 # `status` (which fires at init) means one broken run poisons every
@@ -199,8 +258,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     kind = runtime.runtime_kind()
-    brain = ("Claude Code (your subscription — connectors & skills live)"
-             if kind == "claude" else "MOCK — claude not reachable, scripted replies")
+    brain = ("Hermes Agent (profile tools, skills, memory, MCP, browser integrations live)"
+             if kind == "hermes" else "MOCK — Hermes CLI not reachable")
     vo = (f"ElevenLabs · {voice.voice_id()[:8]}…" if voice.available()
           else "none (add ELEVENLABS_API_KEY for voice)")
     perm = runtime.PERMISSION
@@ -208,12 +267,13 @@ def main():
                  if perm == "bypass" else "")
 
     print(f"""
-  JARVIS · Live HUD
+  JARVIS · Hermes Live HUD
   ──────────────────────────────────────────────
   brain        {brain}
+  profile      {runtime.PROFILE}
   workdir      {runtime.WORKDIR}
   permission   {perm}{perm_note}
-  voice        {vo}
+  voice        {vo} + browser Web Speech fallback
   open         http://localhost:{PORT}
 """, flush=True)
 

@@ -1,34 +1,28 @@
 """
-The command matrix — the six buttons, made real.
+Command matrix for the Hermes-backed JARVIS dashboard.
 
-Each one mutates a small persistent state file and/or changes how the next run
-behaves. Profile, goal and personality are injected into the system prompt on
-every run, so they genuinely persist and shape the assistant.
-
-  /new          start a fresh thread
-  /profile X    remember a fact about the user, forever
-  /goal X       set the standing objective
-  /personality X  overlay a tone on the persona
-  /kanban [X]   show the work queue, or add to it
-  /background X run a mission asynchronously and report when it lands
+Local commands keep the HUD fast for mission control/status while prompts and
+unknown slash commands are handed to Hermes Agent. Hermes-native tool access comes
+from the runtime subprocess (`hermes chat -q ...`) using the configured profile.
 """
 import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
+import subprocess
 import threading
 import time
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent
 STATE_FILE = pathlib.Path(os.environ.get("JARVIS_STATE", ROOT / "state.json"))
-
 _LOCK = threading.Lock()
-_DEFAULT = {"profile": [], "goal": "", "personality": "", "tasks": []}
+_DEFAULT = {"profile": [], "goal": "", "personality": "", "tasks": [], "missions": []}
 
 
-# ─────────────────────────── state ───────────────────────────
-def load():
+def _load_unlocked():
     try:
         d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return {**_DEFAULT, **d}
@@ -36,55 +30,85 @@ def load():
         return dict(_DEFAULT)
 
 
+def load():
+    with _LOCK:
+        return _load_unlocked()
+
+
+def _save_unlocked(d):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = STATE_FILE.with_name(f".{STATE_FILE.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, STATE_FILE)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def save(d):
     with _LOCK:
-        STATE_FILE.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
+        _save_unlocked(d)
+
+
+def update_state(mutator):
+    """Apply one read-modify-write transaction without losing concurrent updates."""
+    with _LOCK:
+        d = _load_unlocked()
+        result = mutator(d)
+        _save_unlocked(d)
+        return result
 
 
 def context_block():
-    """What gets appended to the persona on every run."""
     d = load()
     out = []
     if d["profile"]:
-        out.append("## What you know about the user\n"
-                   + "\n".join(f"- {x}" for x in d["profile"][-40:]))
+        out.append("## User profile notes from JARVIS dashboard\n" + "\n".join(f"- {x}" for x in d["profile"][-40:]))
     if d["goal"]:
-        out.append(f"## Their standing objective\n{d['goal']}\n"
-                   "Keep it in mind; mention it only when it's actually relevant.")
+        out.append(f"## Standing objective\n{d['goal']}\nKeep it in mind; mention it only when relevant.")
     if d["personality"]:
-        out.append(f"## Tone overlay\n{d['personality']}\n"
-                   "This adjusts your delivery. The brevity rules still apply.")
+        out.append(f"## Tone overlay\n{d['personality']}\nThis adjusts delivery; stay concise.")
     open_tasks = [t for t in d["tasks"] if not t.get("done")]
     if open_tasks:
-        out.append("## Their work queue\n"
-                   + "\n".join(f"- {t['text']}" for t in open_tasks[:20]))
+        out.append("## Mission queue\n" + "\n".join(f"- {t['text']}" for t in open_tasks[:20]))
     return "\n\n".join(out)
 
 
-# ─────────────────────────── background jobs ───────────────────────────
-JOBS = {}          # id -> {status, mission, result, started, finished}
+JOBS = {}
 _JOB_LOCK = threading.Lock()
 
 
 def start_background(mission, runner):
-    """runner(message) -> yields runtime events. Runs detached; result stored."""
     jid = uuid.uuid4().hex[:8]
     with _JOB_LOCK:
         JOBS[jid] = {"id": jid, "status": "running", "mission": mission,
                      "result": "", "started": time.time(), "finished": None}
+    update_state(lambda d: d["missions"].append(
+        {"id": jid, "mission": mission, "status": "running", "at": time.time()}))
 
     def _work():
         text = ""
+        status = "done"
         try:
             for ev in runner(mission):
                 if ev.get("t") == "delta":
                     text += ev["text"]
                 elif ev.get("t") == "error":
-                    text = text or ("failed: " + str(ev.get("message", ""))[:200])
-        except Exception as e:                       # noqa: BLE001
-            text = f"failed: {e}"[:200]
+                    status = "failed"
+                    text = text or ("failed: " + str(ev.get("message", ""))[:260])
+        except Exception as e:  # noqa: BLE001
+            status = "failed"
+            text = f"failed: {e}"[:260]
         with _JOB_LOCK:
             JOBS[jid].update(status="done", result=text.strip(), finished=time.time())
+        def finish(d2):
+            for item in d2.get("missions", []):
+                if item.get("id") == jid:
+                    item.update(status=status, finished=time.time(), result=text.strip()[:500])
+        update_state(finish)
 
     threading.Thread(target=_work, daemon=True).start()
     return jid
@@ -96,7 +120,6 @@ def jobs_snapshot():
 
 
 def take_finished():
-    """Return finished jobs once, then forget them (so the UI reports each once)."""
     with _JOB_LOCK:
         done = [dict(j) for j in JOBS.values() if j["status"] == "done"]
         for j in done:
@@ -104,90 +127,134 @@ def take_finished():
         return done
 
 
-# ─────────────────────────── dispatch ───────────────────────────
-_CMD = re.compile(r"^\s*/(new|profile|goal|personality|kanban|background)\b\s*(.*)$",
-                  re.I | re.S)
+_CMD = re.compile(r"^\s*/(new|profile|goal|personality|kanban|mission|missions|background|tools|toolsets|connectors|connect|status|commands|help|browser|clear)\b\s*(.*)$", re.I | re.S)
+
+
+def _hermes_command(*args):
+    configured = os.environ.get("HERMES_CMD", "").strip()
+    if configured:
+        return shlex.split(configured) + list(args)
+    executable = shutil.which("hermes")
+    if executable:
+        return [executable, *args]
+    return ["python3", "-m", "hermes_cli.main", *args]
+
+
+def _shell(cmd, timeout=25):
+    try:
+        p = subprocess.run(cmd, text=True, cwd=os.getcwd(), stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout)
+        return (p.stdout or p.stderr or "").strip()[:3500]
+    except Exception as e:  # noqa: BLE001
+        return f"Unavailable: {e}"
+
+
+def _commands_reply():
+    return """Available dashboard slash commands:
+/new — reset the Hermes thread
+/goal <text|status|clear> — set/read/clear standing objective
+/profile <fact> — add a local profile note injected into Hermes prompts
+/personality <tone> — set Jarvis tone overlay
+/kanban [task] — read/add mission queue item
+/mission [task] — alias for /kanban
+/background <mission> — run a Hermes mission asynchronously
+/tools — show Hermes tool status from `hermes tools list`
+/connectors — explain that connected Hermes tools transfer into this dashboard
+/connect <name> — ask Hermes how to connect a third-party app generally
+/toolsets — ask Hermes to list available toolsets
+/status — local Hermes runtime/profile/status
+/browser <task> — ask Hermes to use browser/Chrome tools
+/clear — clear the response panel locally
+/help or /commands — show this list
+
+You can also type normal Hermes prompts. Unknown slash commands are forwarded to Hermes."""
 
 
 def handle(message, runner=None):
-    """Returns None if this isn't a command.
-
-    Otherwise a dict:
-      fresh   — reset the claude session
-      message — what to actually send to claude (None = don't call claude)
-      reply   — a direct answer, when no model call is needed
-      note    — a line for the action log
-    """
     m = _CMD.match(message or "")
     if not m:
         return None
     cmd, arg = m.group(1).lower(), m.group(2).strip()
     d = load()
 
+    if cmd in ("help", "commands"):
+        return dict(message=None, reply=_commands_reply(), note="commands shown")
+
+    if cmd == "clear":
+        return dict(message=None, reply="Display cleared. Hermes session is unchanged.", note="display clear")
+
     if cmd == "new":
-        return dict(fresh=True,
-                    message=arg or "Start fresh. Greet me in one short line.",
-                    note="thread reset")
+        return dict(fresh=True, message=arg or "Start a fresh Hermes dashboard session. Greet me in one concise JARVIS-style line.", note="Hermes thread reset")
+
+    if cmd == "status":
+        profile = os.environ.get("HERMES_PROFILE", os.environ.get("JARVIS_PROFILE", "default"))
+        runtime = os.environ.get("HERMES_CMD", "hermes")
+        return dict(message=None, reply=f"Hermes dashboard online. profile={profile}; runtime={runtime}; workdir={os.getcwd()}; voice=browser Web Speech + optional ElevenLabs.", note="status read")
+
+    if cmd in ("tools", "toolsets"):
+        if cmd == "tools":
+            out = _shell(_hermes_command("tools", "list"))
+            reply = out or "No tool list returned. Start from a shell where `hermes tools list` works, or set HERMES_CMD."
+            return dict(message=None, reply=reply, note="Hermes tools listed")
+        return dict(message="List my enabled Hermes toolsets and connected third-party tools. Include browser/Chrome availability if present. Keep it concise.", note="toolsets requested")
+
+    if cmd == "connectors":
+        return dict(message=None, note="connector bridge explained", reply=(
+            "This dashboard does not need separate app wiring. It launches Hermes with your active profile, so any third-party app already connected in Hermes transfers here automatically.\n\n"
+            "Connect apps in Hermes itself with: hermes tools, hermes mcp, hermes gateway setup, or the relevant Hermes skill. Then restart this dashboard.\n\n"
+            "Use /tools or /toolsets here to see what the dashboard can currently reach."
+        ))
+
+    if cmd == "connect":
+        target = (arg or "third-party app").strip()
+        return dict(message=(
+            f"Explain the correct Hermes-native way to connect {target} as a third-party app/tool. "
+            "Be generic: the dashboard should inherit whatever is connected to Hermes, not maintain separate credentials. "
+            "Include the relevant Hermes command family if known, like hermes tools, hermes mcp, hermes gateway setup, or a skill."
+        ), note=f"connector help: {target[:40]}")
+
+    if cmd == "browser":
+        task = arg or "open or inspect Google Chrome using the configured Hermes browser/computer-use tools and report what is available"
+        return dict(message=f"Use my Hermes browser/Google Chrome tooling if available: {task}", note="browser mission armed")
 
     if cmd == "profile":
         if not arg:
             facts = d["profile"]
-            return dict(message=None,
-                        reply=("I know " + str(len(facts)) + " things about you."
-                               if facts else "I don't know anything about you yet."),
-                        note="profile read")
-        d["profile"].append(arg)
-        save(d)
-        return dict(message=f'The user just told you this about themselves: "{arg}". '
-                            "You've saved it permanently. Acknowledge in one short line.",
-                    note=f"profile += {arg[:50]}")
+            return dict(message=None, reply=("\n".join(f"- {x}" for x in facts[-20:]) if facts else "I don't know anything about you yet."), note="profile read")
+        update_state(lambda state: state["profile"].append(arg))
+        return dict(message=f'The user saved this dashboard profile note: "{arg}". Acknowledge in one short line.', note=f"profile += {arg[:50]}")
 
     if cmd == "goal":
-        if not arg:
-            return dict(message=None,
-                        reply=d["goal"] or "No standing objective set.",
-                        note="goal read")
-        d["goal"] = arg
-        save(d)
-        return dict(message=f'The user set their standing objective: "{arg}". '
-                            "Acknowledge in one short line.",
-                    note=f"goal set: {arg[:50]}")
+        if arg.lower() == "clear":
+            update_state(lambda state: state.__setitem__("goal", ""))
+            return dict(message=None, reply="Standing objective cleared.", note="goal cleared")
+        if not arg or arg.lower() == "status":
+            return dict(message=None, reply=d["goal"] or "No standing objective set.", note="goal read")
+        update_state(lambda state: state.__setitem__("goal", arg))
+        return dict(message=f'The user set this standing objective: "{arg}". Acknowledge in one concise line.', note=f"goal set: {arg[:50]}")
 
     if cmd == "personality":
         if not arg:
-            return dict(message=None,
-                        reply=d["personality"] or "Running default persona.",
-                        note="persona read")
-        d["personality"] = arg
-        save(d)
-        return dict(message=f'The user just changed your tone to: "{arg}". '
-                            "Reply in one short line, already in that new tone.",
-                    note=f"persona: {arg[:50]}")
+            return dict(message=None, reply=d["personality"] or "Running default JARVIS persona.", note="persona read")
+        update_state(lambda state: state.__setitem__("personality", arg))
+        return dict(message=f'Tone overlay changed to: "{arg}". Reply in one short line using that tone.', note=f"persona: {arg[:50]}")
 
-    if cmd == "kanban":
+    if cmd in ("kanban", "mission", "missions"):
         if arg:
-            d["tasks"].append({"text": arg, "done": False, "at": time.time()})
-            save(d)
-            return dict(message=f'Added to the user\'s work queue: "{arg}". '
-                                "Confirm in one short line.",
-                        note=f"task += {arg[:50]}")
+            update_state(lambda state: state["tasks"].append(
+                {"text": arg, "done": False, "at": time.time()}))
+            return dict(message=f'Added to the mission queue: "{arg}". Confirm in one short line.', note=f"mission += {arg[:50]}")
         open_t = [t["text"] for t in d["tasks"] if not t.get("done")]
         if not open_t:
-            return dict(message=None, reply="Your queue is empty.", note="queue read")
-        return dict(message="Read the user their work queue, briefly, in your own "
-                            "voice. Do not add commentary:\n"
-                            + "\n".join(f"- {t}" for t in open_t),
-                    note=f"queue read ({len(open_t)})")
+            return dict(message=None, reply="Mission queue is empty.", note="queue read")
+        return dict(message=None, reply="Mission queue:\n" + "\n".join(f"- {t}" for t in open_t), note=f"queue read ({len(open_t)})")
 
     if cmd == "background":
         if not arg:
-            return dict(message=None, reply="Give me a mission.", note="background: empty")
+            return dict(message=None, reply="Give me a mission.", note="background empty")
         if runner is None:
-            return dict(message=None, reply="Background missions aren't available.",
-                        note="background unavailable")
+            return dict(message=None, reply="Background missions aren't available.", note="background unavailable")
         jid = start_background(arg, runner)
-        return dict(message=None,
-                    reply=f"On it in the background, sir. I'll report back.",
-                    note=f"mission {jid} started: {arg[:50]}")
+        return dict(message=None, reply=f"Background Hermes mission {jid} launched. I'll report when it lands.", note=f"mission {jid} started: {arg[:50]}")
 
     return None

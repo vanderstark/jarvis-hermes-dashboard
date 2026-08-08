@@ -1,19 +1,23 @@
-/* JARVIS Live HUD — drives Claude Code, streams its telemetry.
+/* JARVIS Live HUD — drives Hermes Agent, streams telemetry.
 
-   The brain is your own `claude` CLI (Path A), so whatever MCP connectors and
-   skills you've configured are live. This file only streams and renders. */
+   The brain is your own `hermes` CLI/profile, so configured Hermes tools,
+   browser automation, skills, memory, MCP servers and third-party connectors are live. */
 const $ = s => document.querySelector(s);
-const RT = {tts:false, stt:false};
+const RT = {tts:false, stt:false, browserStt:false, browserTts:false};
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const speechSynth = window.speechSynthesis;
+const API_TOKEN = document.querySelector('meta[name="jarvis-token"]')?.content || '';
+const apiHeaders = extra => ({'x-jarvis-token': API_TOKEN, ...(extra || {})});
 
 // ── reactor ticks ──
 (() => {
   const g = $('#ticks480');
-  for (let i = 0; i < 96; i++){
-    const a = (i/96) * Math.PI*2, maj = i % 8 === 0;
-    const r0 = maj ? 226 : 230, r1 = 238;
+  for (let i = 0; i < 128; i++){
+    const a = (i/128) * Math.PI*2, maj = i % 8 === 0;
+    const r0 = maj ? 246 : 250, r1 = 260;
     const l = document.createElementNS('http://www.w3.org/2000/svg','line');
-    l.setAttribute('x1', 240+Math.cos(a)*r0); l.setAttribute('y1', 240+Math.sin(a)*r0);
-    l.setAttribute('x2', 240+Math.cos(a)*r1); l.setAttribute('y2', 240+Math.sin(a)*r1);
+    l.setAttribute('x1', 260+Math.cos(a)*r0); l.setAttribute('y1', 260+Math.sin(a)*r0);
+    l.setAttribute('x2', 260+Math.cos(a)*r1); l.setAttribute('y2', 260+Math.sin(a)*r1);
     if (maj) l.setAttribute('class','maj');
     g.appendChild(l);
   }
@@ -53,16 +57,17 @@ function usageBlock(u){
 }
 
 // ── the run ──
-let running = false, answer = '', firstDelta = false, speakDone = Promise.resolve();
+let running = false, answer = '', firstDelta = false, speakThisRun = true;
+let speakDone = Promise.resolve(), activeController = null;
 
-async function transmit(message){
+async function transmit(message, options = {}){
   if (!message.trim()) return;
   if (running){
     // don't silently swallow it — say so, so it never looks like nothing happened
     log('note','BUSY',`still working — "${message.slice(0,40)}" not sent. Wait, or press Esc to cancel.`);
     return;
   }
-  running = true; answer = ''; firstDelta = false;
+  running = true; answer = ''; firstDelta = false; speakThisRun = options.speak !== false;
 
   const fresh = /^\/new\b/.test(message.trim());
   const id = rid();
@@ -80,10 +85,12 @@ async function transmit(message){
   }, 200);
 
   try {
+    activeController = new AbortController();
     const res = await fetch('/api/run', {
-      method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({message, fresh})
+      method:'POST', headers:apiHeaders({'content-type':'application/json'}),
+      body: JSON.stringify({message, fresh}), signal:activeController.signal
     });
+    if (!res.ok) throw new Error(`backend returned HTTP ${res.status}`);
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -99,10 +106,17 @@ async function transmit(message){
       }
     }
   } catch (e){
-    log('error', 'ERROR', String(e).slice(0,200));
-    setState('error', 'FAULT', 'stream dropped');
-    setTag('err', 'ERROR');
+    if (e?.name === 'AbortError'){
+      log('note', 'CANCEL', 'run cancelled');
+      setState('', 'STANDBY', 'cancelled');
+      setTag('', 'IDLE');
+    } else {
+      log('error', 'ERROR', String(e).slice(0,200));
+      setState('error', 'FAULT', 'stream dropped');
+      setTag('err', 'ERROR');
+    }
   }
+  activeController = null;
   running = false;
   clearInterval(tick);
   await speakDone;                 // don't return until Jarvis has finished talking
@@ -112,9 +126,8 @@ function handle(ev){
   switch (ev.t){
     case 'status':
       if (ev.session_id) sys('session', ev.session_id.slice(0,8));
-      log('status', 'STATUS',
-          `core online · tools=${ev.tools} `
-          + `mcp=[${(ev.mcp||[]).join(', ')||'—'}] permission=${ev.permission}`);
+        const msg = `core online · Hermes tools=${ev.tools ?? 0} profile=${ev.profile||'default'} permission=${ev.permission||'normal'}`;
+      log('status', 'STATUS', msg);
       break;
     case 'latency':
       log('latency', 'LATENCY', `first token after ${ev.ms}ms`);
@@ -141,7 +154,7 @@ function handle(ev){
       setTag('done', 'COMPLETE');
       log('complete', 'COMPLETE', ev.ms!=null?`run completed in ${ev.ms}ms`:'run completed');
       renderAnswer(true);
-      speakDone = speak(answer);         // transmit() awaits this before re-listening
+      speakDone = speakThisRun ? speak(answer) : Promise.resolve();
       break;
     case 'error':
       setState('error', 'FAULT', ev.message?.slice(0,40) || 'error');
@@ -164,6 +177,19 @@ function renderAnswer(finaldone){
   el.scrollTop = el.scrollHeight;
 }
 
+function cleanForSpeech(text){
+  return String(text || '')
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && !/^(session_id:|session:|duration:|messages:|query:|initializing agent|resume this session|hermes --resume|[-─=]{3,})/i.test(line))
+    .join(' ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[*_#>`]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 /* ══════════ continuous voice conversation ══════════
    Click VOICE once. From then on: listen → you stop → transcribe → Jarvis
    answers and speaks → it listens again, automatically. No re-clicking between
@@ -173,20 +199,33 @@ function renderAnswer(finaldone){
    — otherwise it transcribes his own voice through the speakers and talks to
    itself forever. That's why re-arming happens only after he finishes. */
 let convo = false, suppress = false;
+let recognition = null;
 let micStream=null, recorder=null, chunks=[], actx=null, analyser=null, vdata=null;
 let vad=null, spoke=false, loudAt=0, turnStart=0;
 let floorSum=0, floorN=0, threshold=0.02, peak=0, calibrating=true;
-const SILENCE=900, MIN_TURN_MS=350, MAX_TURN_MS=18000, NO_SPEECH_MS=7000;
+const SILENCE=900, MIN_TURN_MS=350, MAX_TURN_MS=18000, NO_SPEECH_MS=10000;
 
 // ── voice out ──
 let muted = false, player = null;
 function speak(text){
   return new Promise(resolve => {
-    text = (text||'').trim();
-    if (muted || !RT.tts || !text) return resolve();
-    suppress = true;                                  // go deaf before audio starts
+    text = cleanForSpeech(text);
+    if (muted || !text) return resolve();
+    suppress = true;
     const spoken = text.length > 700 ? text.slice(0, 680).replace(/\s+\S*$/,'') + '…' : text;
-    fetch('/api/speak', {method:'POST', headers:{'content-type':'application/json'},
+    if (!RT.tts && RT.browserTts && speechSynth){
+      try{
+        speechSynth.cancel();
+        const u = new SpeechSynthesisUtterance(spoken);
+        u.rate = 0.95; u.pitch = 0.82; u.volume = 1;
+        document.body.classList.add('speaking');
+        u.onend = u.onerror = () => { document.body.classList.remove('speaking'); resolve(); };
+        speechSynth.speak(u);
+        return;
+      }catch(_){ return resolve(); }
+    }
+    if (!RT.tts) return resolve();
+    fetch('/api/speak', {method:'POST', headers:apiHeaders({'content-type':'application/json'}),
                          body: JSON.stringify({text:spoken})})
       .then(r => r.ok ? r.blob() : Promise.reject())
       .then(blob => {
@@ -206,24 +245,39 @@ function speak(text){
 // ── start / stop the whole conversation ──
 async function micToggle(){
   if (convo){ stopConvo(); return; }
-  if (!RT.stt){ log('error','VOICE','no ElevenLabs key — set one in .env'); return; }
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia(
-      {audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
-  } catch(e){ log('error','VOICE','mic blocked — allow it in the address bar'); return; }
-  actx = new (window.AudioContext||window.webkitAudioContext)();
-  await actx.resume();
-  analyser = actx.createAnalyser(); analyser.fftSize = 1024;
-  actx.createMediaStreamSource(micStream).connect(analyser);
-  vdata = new Uint8Array(analyser.fftSize);
-  convo = true; suppress = false;
-  $('#mic').classList.add('on'); $('#mic').textContent = '● LIVE';
-  log('voice','VOICE','conversation open · listening');
-  beginTurn();
+  // Prefer ElevenLabs server-side STT when configured. Browser STT is unreliable
+  // across Chrome profiles and often fails silently; ElevenLabs receives the
+  // actual microphone recording from MediaRecorder and is much more consistent.
+  if (RT.stt){
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia(
+        {audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+    } catch(e){ log('error','VOICE','mic blocked — allow it in the address bar'); return; }
+    actx = new (window.AudioContext||window.webkitAudioContext)();
+    await actx.resume();
+    analyser = actx.createAnalyser(); analyser.fftSize = 1024;
+    actx.createMediaStreamSource(micStream).connect(analyser);
+    vdata = new Uint8Array(analyser.fftSize);
+    convo = true; suppress = false;
+    $('#mic').classList.add('on'); $('#mic').textContent = '● ElevenLabs Live';
+    log('voice','VOICE','ElevenLabs voice conversation open · listening');
+    beginTurn();
+    return;
+  }
+  if (SpeechRecognition){
+    convo = true; suppress = false;
+    $('#mic').classList.add('on'); $('#mic').textContent = '● Browser Live';
+    log('voice','VOICE','browser speech recognition open · listening');
+    setState('listening','LISTENING','browser speech online');
+    startBrowserRecognition();
+    return;
+  }
+  log('error','VOICE','no speech recognition available — add ElevenLabs key or use Chrome browser STT');
 }
 
 function stopConvo(){
   convo = false; suppress = false;
+  if (recognition){ try{ recognition.onend = null; recognition.stop(); }catch(_){} recognition=null; }
   if (vad){ clearInterval(vad); vad=null; }
   if (recorder && recorder.state==='recording'){ recorder._cancel=true; try{recorder.stop();}catch(_){} }
   recorder = null;
@@ -236,7 +290,43 @@ function stopConvo(){
   setState('', 'STANDBY', 'awaiting uplink');
 }
 
-// ── one listening turn ──
+// ── browser speech turn ──
+function startBrowserRecognition(){
+  if (!convo || suppress || !SpeechRecognition) return;
+  recognition = new SpeechRecognition();
+  recognition.lang = 'en-US';
+  recognition.interimResults = true;
+  recognition.continuous = false;
+  let finalText = '';
+  recognition.onresult = e => {
+    let interim = '';
+    for (let i=e.resultIndex; i<e.results.length; i++){
+      const txt = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += txt;
+      else interim += txt;
+    }
+    const shown = (finalText || interim || '').trim();
+    if (shown) $('#strun').textContent = 'HEARD: ' + shown.slice(0,42);
+  };
+  recognition.onerror = e => log('error','VOICE',`browser speech: ${e.error || 'error'}`);
+  recognition.onend = async () => {
+    const text = finalText.trim();
+    if (!convo) return;
+    if (!text){ if (!suppress) setTimeout(startBrowserRecognition, 250); return; }
+    log('voice','VOICE',`browser transcribed: "${text}"`);
+    const armed = $('#input').dataset.cmd || '';
+    const full = (armed ? armed + ' ' : '') + text;
+    $('#input').value = ''; disarm();
+    log('send','SEND',`auto-sent voice: ${full}`);
+    await transmit(full);
+    suppress = false;
+    if (convo) setTimeout(startBrowserRecognition, 350);
+  };
+  setState('listening','LISTENING','browser speech online');
+  try{ recognition.start(); }catch(e){ log('error','VOICE','speech recognition failed to start'); }
+}
+
+// ── one server-side ElevenLabs listening turn ──
 function beginTurn(){
   if (!convo || suppress || !micStream) return;
   chunks = []; spoke = false; peak = 0;
@@ -281,7 +371,7 @@ function vtick(){
     floorSum += rms; floorN++;
     if (t - turnStart > 300){
       const floor = floorSum / Math.max(1, floorN);
-      threshold = Math.max(0.012, floor * 2.2 + 0.006);
+      threshold = Math.max(0.006, floor * 1.6 + 0.003);
       calibrating = false;
     }
     return;
@@ -313,7 +403,7 @@ async function ship(){
   const t0 = performance.now();
   try {
     const r = await fetch('/api/listen', {method:'POST',
-      headers:{'content-type':blob.type||'audio/webm'}, body:blob}).then(r=>r.json());
+      headers:apiHeaders({'content-type':blob.type||'audio/webm'}), body:blob}).then(r=>r.json());
     const text = (r.text||'').trim();
     const ms = Math.round(performance.now() - t0);
     if (!text){
@@ -342,22 +432,41 @@ function disarm(){
   document.querySelectorAll('.cmd').forEach(c=>c.classList.remove('armed'));
   $('#input').dataset.cmd = '';
 }
+const PAYLOAD_COMMANDS = new Set(['/goal','/browser','/background','/mission','/personality']);
 $('#cmds').addEventListener('click', e => {
   const b = e.target.closest('.cmd'); if (!b) return;
   const cmd = b.dataset.cmd;
-  if ($('#input').dataset.cmd === cmd){ disarm(); $('#tip').textContent = defaultTip; return; }
-  disarm(); b.classList.add('armed'); $('#input').dataset.cmd = cmd;
-  $('#input').focus();
-  $('#tip').textContent = TIPS[cmd] || `Armed ${cmd} — now type or speak.`;
-  log('command', 'COMMAND', `armed ${cmd}`);
+  if (running){
+    log('note','BUSY',`${cmd} not sent — JARVIS is still working.`);
+    return;
+  }
+
+  // Every matrix button executes its base command immediately. Commands that
+  // accept an argument remain armed afterwards so the next typed or spoken
+  // payload is sent as `/command payload`.
+  disarm();
+  if (PAYLOAD_COMMANDS.has(cmd)){
+    b.classList.add('armed');
+    $('#input').dataset.cmd = cmd;
+    $('#input').focus();
+    $('#tip').textContent = `${TIPS[cmd] || cmd} The command is live and remains armed for your next payload.`;
+  } else {
+    $('#tip').textContent = defaultTip;
+  }
+  log('command', 'COMMAND', `executing ${cmd} on Hermes backend`);
+  transmit(cmd, {speak: !['/tools','/commands'].includes(cmd)});
 });
 const TIPS = {
-  '/new':'Fresh thread — clears the conversation and starts Jarvis clean.',
-  '/goal':'Say your standing objective, e.g. “grow the newsletter to 5k”.',
-  '/profile':'Tell Jarvis about you — it saves it for every future run.',
+  '/new':'Fresh thread — clears the Hermes conversation and starts clean.',
+  '/goal':'Say your standing objective, e.g. “ship the dashboard and verify tool access”.',
+  '/tools':'Shows Hermes tool status from the active profile.',
+  '/toolsets':'Asks Hermes to list enabled toolsets and connected tools.',
+  '/browser':'Say a Chrome/browser mission, e.g. “inspect the current tab”.',
   '/background':'Say a mission, e.g. “research competitors and save a report”.',
-  '/personality':'Set the persona, e.g. “dry, brief, British butler”.',
-  '/kanban':'Ask about the work queue, e.g. “what’s on my board today?”.'
+  '/mission':'Add or read mission queue items.',
+  '/personality':'Set the persona, e.g. “calm, laconic, Stark tower operator”.',
+  '/kanban':'Ask about the work queue, e.g. “what’s on my board today?”.',
+  '/commands':'Show all dashboard slash commands.'
 };
 let defaultTip = '';
 
@@ -373,6 +482,20 @@ function sendFromInput(){
 }
 $('#run').onclick = sendFromInput;
 $('#mic').onclick = micToggle;
+$('#showCommands').onclick = () => transmit('/commands', {speak:false});
+$('#missionBtn').onclick = () => transmit('/mission');
+$('#clearBtn').onclick = () => { answer=''; $('#response').innerHTML='<span class="rplaceholder">Display cleared. Standing by.</span>'; log('note','CLEAR','response panel cleared'); };
+document.querySelectorAll('[data-quick]').forEach(b => b.onclick = () =>
+  transmit(b.dataset.quick, {speak:false}));
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (running && activeController){
+    fetch('/api/cancel', {method:'POST', headers:apiHeaders({'content-type':'application/json'}), body:'{}'}).catch(()=>{});
+    activeController.abort();
+    return;
+  }
+  if (convo) stopConvo();
+});
 $('#mute').onclick = () => {
   muted = !muted; const b=$('#mute');
   b.textContent = muted?'🔇':'🔊'; b.classList.toggle('on',!muted); b.classList.toggle('off',muted);
@@ -393,7 +516,7 @@ setInterval(() => sys('clock', now()), 1000);
 // poll for finished /background missions and report them when they land
 setInterval(async () => {
   try {
-    const j = await fetch('/api/jobs').then(r => r.json());
+    const j = await fetch('/api/jobs', {headers:apiHeaders()}).then(r => r.json());
     for (const d of (j.done || [])){
       log('complete','MISSION', `${d.mission} → ${(d.result||'').slice(0,200)}`);
       if (!running) speak(`Mission complete. ${(d.result||'').slice(0,300)}`);
@@ -407,17 +530,25 @@ setInterval(async () => {
   try {
     const s = await fetch('/api/status').then(r=>r.json());
     RT.tts = s.tts==='elevenlabs'; RT.stt = s.stt==='elevenlabs';
+    RT.browserStt = !!SpeechRecognition; RT.browserTts = !!speechSynth;
 
-    sys('gw', 'online · :8730', 'ok');
-    sys('brain', 'JARVIS Core', 'ok');
-    sys('voice', RT.tts ? 'ElevenLabs' : 'off', RT.tts ? '' : 'warn');
-    sys('profile', 'default');
-    sys('session', s.session ? s.session.slice(0,8) : 'none');
+    const port = location.port || '8730';
+    sys('gw', `online · :${port}`, 'ok');
+    sys('brain', s.runtime === 'hermes' ? 'Hermes Agent' : 'Hermes offline', s.runtime === 'hermes' ? 'ok' : 'warn');
+    sys('voice', `${RT.stt?'ElevenLabs STT':'Browser STT'} / ${RT.tts?'ElevenLabs TTS':'Browser TTS'}`, (RT.browserStt||RT.stt) ? '' : 'warn');
+    sys('profile', s.profile || 'default');
+    sys('runtime', s.runtime || '—', s.runtime === 'hermes' ? 'ok' : 'warn');
     sys('clock', now());
+    $('#top-gw').textContent = `Gateway: online ${location.origin}`;
+    $('#top-profile').textContent = 'Profile: ' + (s.profile || 'default');
+    $('#top-voice').textContent = 'Voice: ' + (RT.stt ? 'ElevenLabs STT' : (RT.browserStt ? 'browser STT' : s.stt)) + ' / ' + (RT.tts ? 'ElevenLabs TTS' : 'browser TTS');
+    const tools = (s.tools || []).slice(0, 12);
+    $('#toolsList').innerHTML = tools.length ? tools.map(t => `<span class="chip">${esc(t)}</span>`).join('') : '<span class="chip ghost">Hermes tool list unavailable — set HERMES_CMD if needed</span>';
 
     log('status', 'BOOT',
-        `gateway online · core ready · permission=${s.permission}`);
-    log('voice', 'VOICE', `channel ready — ElevenLabs STT/TTS`);
+        `gateway online · ${s.runtime} core · profile=${s.profile || 'default'} · permission=${s.permission}`);
+    log('voice', 'VOICE', `channel ready — ${RT.stt ? 'ElevenLabs STT' : (RT.browserStt ? 'browser STT' : s.stt)} / ${RT.tts ? 'ElevenLabs TTS' : 'browser TTS'}`);
+    $('#mic').textContent = RT.stt ? '◉ ElevenLabs Voice' : '◉ Browser Voice';
     setState('', 'STANDBY', 'awaiting uplink');
   } catch(e){
     sys('gw','offline','warn');
